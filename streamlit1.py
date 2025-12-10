@@ -87,6 +87,19 @@ df["y_recv"] = df["y"] + df["pass_distance_received"] * np.sin(df["pass_angle_re
 df["x_pass"] = df["x_end"] + df["pass_distance"] * np.cos(df["pass_angle_rad"])
 df["y_pass"] = df["y_end"] + df["pass_distance"] * np.sin(df["pass_angle_rad"])
 
+# Convert time_start strings like "12:34.5" to minutes as float
+def _to_minute(ts: str) -> float:
+	try:
+		min_part, sec_part = str(ts).split(":")
+		return float(min_part) + float(sec_part) / 60
+	except Exception:
+		return np.nan
+
+df["time_min"] = df["time_start"].apply(_to_minute)
+# Precompute plotted angle so data 0° points right, 90° points up, -90° down
+# Vega-Lite polar starts at 0° top and increases clockwise, so rotate by (90 - angle)
+df["pass_angle_plot"] = ((90 - pd.to_numeric(df["pass_angle"], errors="coerce") + 180) % 360)
+
 id_cols = ["x", "y"]  # plus anything that identifies the event/point
 numeric_extra_cols = (
 	df.drop(columns=id_cols)
@@ -103,6 +116,8 @@ df_long = df.melt(
 
 # --- Define a selection based on x and y (your coordinates) ---
 point_sel = alt.selection_point(fields=["x", "y"], nearest=True, empty="none")
+# Separate selection for fading so that opacity stays at 1 before anything is picked
+fade_sel = alt.selection_point(fields=["x", "y"], nearest=True)
 
 scatter = (
 	alt.Chart(df)
@@ -110,6 +125,7 @@ scatter = (
 	.encode(
 		x=alt.X("x:Q", scale=alt.Scale(domain=[-52.5, 52.5]), title=""),
 		y=alt.Y("y:Q", scale=alt.Scale(domain=[-34, 34]), title=""),
+		opacity=alt.condition(fade_sel, alt.value(1), alt.value(0.2)),
 		tooltip=[
 			"player_name",
 			#"team_name",
@@ -120,11 +136,12 @@ scatter = (
 			"y",
 			"x_end",
 			"y_end",
+			"pass_angle",
 			"pass_outcome",
 		],
 	)
 	.properties(width=PITCH_WIDTH, height=PITCH_HEIGHT)
-	.add_params(point_sel)
+	.add_params(point_sel, fade_sel)
 )
 
 highlight_scatter = (
@@ -225,6 +242,54 @@ unsuccessful_vec = (
 	)
 )
 
+# --- Timeline of player involvements across 0-90 minutes ---
+timeline = (
+	alt.Chart(df)
+	.mark_tick(color="orange", thickness=2, size=40)
+	.encode(
+		x=alt.X("time_min:Q", scale=alt.Scale(domain=[0, 95]), title="Minute"),
+		y=alt.value(0),
+		color=alt.condition(point_sel, alt.value("red"), alt.value("orange")),
+		tooltip=["time_start", "pass_outcome"],
+	)
+	.properties(width=PITCH_WIDTH, height=60)
+)
+
+# --- Rose plot of pass angle distribution ---
+rose_base = (
+	alt.Chart(df)
+	.transform_filter("isValid(datum.pass_angle_plot)")
+	.mark_arc(innerRadius=40)
+	.encode(
+		theta=alt.Theta("pass_angle_plot:Q", bin=alt.Bin(step=15), scale=alt.Scale(domain=[-180, 180])),
+		radius=alt.Radius("count()", scale=alt.Scale(type="sqrt", rangeMin=10)),
+		color=alt.Color(
+			"count():Q",
+			scale=alt.Scale(range=["#1f2933", "#ffffff"]),
+			legend=alt.Legend(title="Pass count"),
+		),
+		tooltip=[
+			alt.Tooltip("count():Q", title="Passes"),
+			alt.Tooltip("pass_angle:Q", bin=alt.Bin(step=15), title="Angle bin"),
+			alt.Tooltip("pass_angle_plot:Q", bin=alt.Bin(step=15), title="Plotted bin (0°=right)"),
+		],
+	)
+)
+
+arrow_annot = (
+	alt.Chart(pd.DataFrame({"x": [PITCH_WIDTH * 0.8], "y": [24], "label": ["Attack →"]}))
+	.mark_text(fontWeight="bold", fontSize=16, color="black")
+	.encode(
+		x="x:Q",
+		y="y:Q",
+		text="label:N",
+	)
+)
+
+rose = alt.layer(rose_base, arrow_annot).properties(
+	width=PITCH_WIDTH, height=320, title="Pass Direction Distribution"
+)
+
 # --- Bar chart showing attributes for the selected point ---
 bars = (
 	alt.Chart(df_long)
@@ -314,5 +379,6 @@ pitch = alt.layer(
 	unsuccessful_vec
 ).properties(width=600, height=360)
 
-combined = pitch | bars
+left_col = alt.vconcat(pitch, timeline, rose).resolve_scale(x="independent")
+combined = left_col | bars
 st.altair_chart(combined, use_container_width=True)
